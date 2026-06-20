@@ -3,77 +3,69 @@ package main
 import (
 	"context"
 	"fmt"
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
-	"github.com/joho/godotenv"
-	"github.com/sashabaranov/go-openai"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
+	"github.com/joho/godotenv"
+	"github.com/sashabaranov/go-openai"
 )
 
+const bufferSize = 1000
+
 type CircularBuffer struct {
-	data  [400]string
+	data  [bufferSize]string
 	index int
 }
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
+	_ = godotenv.Load()
 
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	botUsername := os.Getenv("TELEGRAM_BOT_USERNAME")
+	groqToken := os.Getenv("GROQ_API_TOKEN")
+	groupChatIDStr := os.Getenv("TELEGRAM_GROUP_CHAT_ID")
+
+	if botToken == "" || groqToken == "" || groupChatIDStr == "" {
+		log.Fatal("Missing env vars: TELEGRAM_BOT_TOKEN, GROQ_API_TOKEN, TELEGRAM_GROUP_CHAT_ID")
+	}
+
+	groupChatID, err := strconv.ParseInt(groupChatIDStr, 10, 64)
+	if err != nil {
+		log.Fatal("TELEGRAM_GROUP_CHAT_ID must be a valid integer (e.g. -1001234567890)")
+	}
 
 	botAPI, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
 		log.Panic(err)
 	}
+	botAPI.Debug = false
+	log.Printf("✅ Bot running as @%s", botAPI.Self.UserName)
 
-	botUsername := os.Getenv("TELEGRAM_BOT_USERNAME")
-	if botUsername == "" {
-		log.Fatal("TELEGRAM_BOT_USERNAME not set in .env file")
-	}
+	// Health endpoint — keeps Render alive when pinged by UptimeRobot
+	go func() {
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "chi-shod-bot is alive ✅")
+		})
+		log.Printf("Health server on :%s", port)
+		http.ListenAndServe(":"+port, nil)
+	}()
 
-	botAdminUsername := os.Getenv("TELEGRAM_BOT_ADMIN_USERNAME")
-	if botAdminUsername == "" {
-		log.Fatal("TELEGRAM_BOT_ADMIN_USERNAME not set in .env file")
-	}
-
-	botAdminChatIDStr := os.Getenv("TELEGRAM_BOT_ADMIN_CHAT_ID")
-	if botAdminChatIDStr == "" {
-		log.Fatal("TELEGRAM_BOT_ADMIN_CHAT_ID not set in .env file")
-	}
-	botAdminChatID, err := strconv.ParseInt(botAdminChatIDStr, 10, 64)
+	// Polling mode — no webhook / HTTPS required
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+	updates, err := botAPI.GetUpdatesChan(u)
 	if err != nil {
-		log.Fatal("TELEGRAM_BOT_ADMIN_CHAT_ID is not a valid integer")
+		log.Panic(err)
 	}
-
-	botGroupChatIDStr := os.Getenv("TELEGRAM_BOT_GROUP_CHAT_ID")
-	if botGroupChatIDStr == "" {
-		log.Fatal("TELEGRAM_BOT_GROUP_CHAT_ID not set in .env file")
-	}
-	botGroupChatID, err := strconv.ParseInt(botGroupChatIDStr, 10, 64)
-	if err != nil {
-		log.Fatal("TELEGRAM_BOT_GROUP_CHAT_ID is not a valid integer")
-	}
-
-	httpPort := os.Getenv("HTTP_PORT")
-	if httpPort == "" {
-		log.Fatal("HTTP_PORT not set in .env file")
-	}
-
-	openAiToken := os.Getenv("OPENAI_TOKEN")
-	if openAiToken == "" {
-		log.Fatal("OPENAI_TOKEN not set in .env file")
-	}
-
-	botAPI.Debug = true
-	log.Printf("Authorized on account %s", botAPI.Self.UserName)
-
-	updates := botAPI.ListenForWebhook("/")
-	go http.ListenAndServe(":"+httpPort, nil)
 
 	cb := &CircularBuffer{}
 
@@ -83,65 +75,69 @@ func main() {
 		}
 
 		chatID := update.Message.Chat.ID
+		text := update.Message.Text
 
-		//Uncomment this to know your PV or group chat ID
-		//msg := tgbotapi.NewMessage(chatID, strconv.FormatInt(chatID, 10))
-		//botAPI.Send(msg)
-		//continue
-
-		if chatID != botAdminChatID && chatID != botGroupChatID {
-			msg := tgbotapi.NewMessage(chatID, "Sorry, only admin can communicate with this bot.")
-			botAPI.Send(msg)
+		if chatID != groupChatID {
 			continue
 		}
 
-		if update.Message.Text == "/start" || update.Message.Text == "/start@"+botUsername {
-			msg := tgbotapi.NewMessage(chatID, "Hi! I can summarize your group chat in Persian.")
+		switch {
+		case text == "/start" || text == "/start@"+botUsername:
+			msg := tgbotapi.NewMessage(chatID,
+				"سلام! 👋\nبا دستور /chishod خلاصه‌ی آخرین پیام‌های گروه رو می‌گیری.")
 			botAPI.Send(msg)
-		} else if update.Message.Text == "/chishod" || update.Message.Text == "/chishod@"+botUsername {
-			if update.Message.From.UserName != botAdminUsername {
-				msg := tgbotapi.NewMessage(chatID, "Sorry, this command is only available to the bot admin.")
+
+		case text == "/chishod" || text == "/chishod@"+botUsername:
+			allMessages := cb.ConcatMessages()
+			if allMessages == "" {
+				msg := tgbotapi.NewMessage(chatID, "❌ هنوز پیامی در بافر ثبت نشده!")
 				botAPI.Send(msg)
 				continue
 			}
-			allMessages := cb.ConcatMessages()
-			if allMessages == "" {
-				msg := tgbotapi.NewMessage(chatID, "No messages yet.")
-				botAPI.Send(msg)
-			}
-			openaiResp := OpenAIRequest(openAiToken, allMessages)
-			msg := tgbotapi.NewMessage(chatID, openaiResp)
+
+			botAPI.Send(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping))
+
+			summary := GroqRequest(groqToken, allMessages)
+			msg := tgbotapi.NewMessage(chatID, "📋 *خلاصه مکالمات اخیر:*\n\n"+summary)
+			msg.ParseMode = "Markdown"
 			botAPI.Send(msg)
 			cb.Empty()
-		} else if chatID == botGroupChatID {
+
+		default:
 			cb.AddMessage(update.Message)
 		}
 	}
 }
 
-// AddMessage Adds a new message to the buffer
 func (cb *CircularBuffer) AddMessage(message *tgbotapi.Message) {
-	if len(message.Text) <= 1 {
+	if len(strings.TrimSpace(message.Text)) <= 1 {
 		return
 	}
 	text := message.From.FirstName
 	if message.ReplyToMessage != nil {
-		text = text + "(در پاسخ به " + message.ReplyToMessage.From.FirstName + ")"
+		text += " (در پاسخ به " + message.ReplyToMessage.From.FirstName + ")"
 	}
-	text += ": " + StringReplace(message.Text)
+	text += ": " + strings.ReplaceAll(message.Text, "\n", " ")
+
 	cb.data[cb.index] = text
-	cb.index = (cb.index + 1) % 400
+	cb.index = (cb.index + 1) % bufferSize
 }
 
-// ConcatMessages Concatenates all messages into a single string with break lines between them
 func (cb *CircularBuffer) ConcatMessages() string {
 	var messages []string
-	messages = append(messages, "این یک مکالمه در گروه است. خلاصه ای از این مکالمه به فارسی و در حداکثر دو خط ارائه بده: ")
-	for i := 0; i < 400; i++ {
-		idx := (cb.index + i) % 400
+	messages = append(messages,
+		"این یک مکالمه در یک گروه تلگرامی است. "+
+			"یک خلاصه‌ی کوتاه (حداکثر ۳ خط) از مهم‌ترین موضوعات مطرح‌شده را به فارسی بنویس:")
+
+	for i := 0; i < bufferSize; i++ {
+		idx := (cb.index + i) % bufferSize
 		if cb.data[idx] != "" {
 			messages = append(messages, cb.data[idx])
 		}
+	}
+
+	if len(messages) <= 1 {
+		return ""
 	}
 	return strings.Join(messages, "\n")
 }
@@ -153,14 +149,6 @@ func (cb *CircularBuffer) Empty() {
 	cb.index = 0
 }
 
-// StringReplace Replaces all emojis with an empty string
-func StringReplace(s string) string {
-	//var emojiRx = regexp.MustCompile(`[\x{1F600}-\x{1F6FF}|[\x{2600}-\x{26FF}]`)
-	//s = emojiRx.ReplaceAllString(s, ``)
-	return strings.Replace(s, "\n", " ", -1)
-}
-
-// TrimToMax Trims a string to a maximum length
 func TrimToMax(s string, maxLen int) string {
 	if len(s) > maxLen {
 		return s[:maxLen]
@@ -168,27 +156,31 @@ func TrimToMax(s string, maxLen int) string {
 	return s
 }
 
-// OpenAIRequest Sends a request to OpenAI API and returns the response
-func OpenAIRequest(token string, text string) string {
-	client := openai.NewClient(token)
-	text = TrimToMax(text, 8000) // Max length of a chatgpt prompt is 4,096 tokens ~ 8,000 characters
+func GroqRequest(token string, text string) string {
+	config := openai.DefaultConfig(token)
+	config.BaseURL = "https://api.groq.com/openai/v1"
+	client := openai.NewClientWithConfig(config)
+
+	text = TrimToMax(text, 14000)
 
 	resp, err := client.CreateChatCompletion(
 		context.Background(),
 		openai.ChatCompletionRequest{
-			Model: openai.GPT3Dot5Turbo,
+			Model: "llama-3.3-70b-versatile",
 			Messages: []openai.ChatCompletionMessage{
 				{
 					Role:    openai.ChatMessageRoleUser,
 					Content: text,
 				},
 			},
+			MaxTokens: 600,
 		},
 	)
-
 	if err != nil {
-		return fmt.Sprintf("ChatCompletion error: %v\n", err)
+		return fmt.Sprintf("❌ خطا در دریافت خلاصه: %v", err)
 	}
-
+	if len(resp.Choices) == 0 {
+		return "❌ پاسخی دریافت نشد."
+	}
 	return resp.Choices[0].Message.Content
 }
