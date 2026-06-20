@@ -19,6 +19,7 @@ const bufferSize = 1000
 type CircularBuffer struct {
 	data  [bufferSize]string
 	index int
+	count int // تعداد واقعی پیام‌های ذخیره‌شده
 }
 
 func main() {
@@ -59,7 +60,7 @@ func main() {
 		http.ListenAndServe(":"+port, nil)
 	}()
 
-	// Polling mode — no webhook / HTTPS required
+	// Polling mode
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	updates, err := botAPI.GetUpdatesChan(u)
@@ -84,12 +85,44 @@ func main() {
 		switch {
 		case text == "/start" || text == "/start@"+botUsername:
 			msg := tgbotapi.NewMessage(chatID,
-				"سلام! 👋\nبا دستور /chishod خلاصه‌ی آخرین پیام‌های گروه رو می‌گیری.")
+				"سلام! 👋\n\n"+
+					"دستورات:\n"+
+					"/chishod — خلاصه همه پیام‌های بافر (تا ۱۰۰۰)\n"+
+					"/chishod 200 — خلاصه ۲۰۰ پیام آخر\n"+
+					"/chishod 500 — خلاصه ۵۰۰ پیام آخر")
 			botAPI.Send(msg)
 
-		case text == "/chishod" || text == "/chishod@"+botUsername:
-			allMessages := cb.ConcatMessages()
-			if allMessages == "" {
+		case strings.HasPrefix(text, "/chishod"):
+			// استخراج عدد از دستور (مثلاً /chishod 500 یا /chishod500)
+			arg := text
+			arg = strings.TrimPrefix(arg, "/chishod@"+botUsername)
+			arg = strings.TrimPrefix(arg, "/chishod")
+			arg = strings.TrimSpace(arg)
+
+			requestedCount := 0 // 0 = همه پیام‌ها
+
+			if arg != "" {
+				n, parseErr := strconv.Atoi(arg)
+				if parseErr != nil {
+					msg := tgbotapi.NewMessage(chatID,
+						"❌ فرمت اشتباه!\nمثال: /chishod یا /chishod 500")
+					botAPI.Send(msg)
+					continue
+				}
+				if n <= 0 {
+					msg := tgbotapi.NewMessage(chatID, "❌ عدد باید بیشتر از ۰ باشه!")
+					botAPI.Send(msg)
+					continue
+				}
+				// سقف ۱۰۰۰ پیام
+				if n > bufferSize {
+					n = bufferSize
+				}
+				requestedCount = n
+			}
+
+			prompt, actualCount := cb.BuildPrompt(requestedCount)
+			if prompt == "" {
 				msg := tgbotapi.NewMessage(chatID, "❌ هنوز پیامی در بافر ثبت نشده!")
 				botAPI.Send(msg)
 				continue
@@ -97,8 +130,10 @@ func main() {
 
 			botAPI.Send(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping))
 
-			summary := GroqRequest(groqToken, allMessages)
-			msg := tgbotapi.NewMessage(chatID, "📋 *خلاصه مکالمات اخیر:*\n\n"+summary)
+			summary := GroqRequest(groqToken, prompt)
+
+			header := fmt.Sprintf("📋 *خلاصه %d پیام اخیر:*\n\n", actualCount)
+			msg := tgbotapi.NewMessage(chatID, header+summary)
 			msg.ParseMode = "Markdown"
 			botAPI.Send(msg)
 			cb.Empty()
@@ -121,25 +156,44 @@ func (cb *CircularBuffer) AddMessage(message *tgbotapi.Message) {
 
 	cb.data[cb.index] = text
 	cb.index = (cb.index + 1) % bufferSize
+	if cb.count < bufferSize {
+		cb.count++
+	}
 }
 
-func (cb *CircularBuffer) ConcatMessages() string {
-	var messages []string
-	messages = append(messages,
-		"این یک مکالمه در یک گروه تلگرامی است. "+
-			"یک خلاصه‌ی کوتاه (حداکثر ۳ خط) از مهم‌ترین موضوعات مطرح‌شده را به فارسی بنویس:")
+// BuildPrompt آخرین n پیام رو برمیگردونه (n=0 یعنی همه)
+// همچنین تعداد واقعی پیام‌های انتخاب‌شده رو برمیگردونه
+func (cb *CircularBuffer) BuildPrompt(n int) (string, int) {
+	if cb.count == 0 {
+		return "", 0
+	}
 
-	for i := 0; i < bufferSize; i++ {
-		idx := (cb.index + i) % bufferSize
-		if cb.data[idx] != "" {
-			messages = append(messages, cb.data[idx])
+	// تعیین تعداد
+	take := cb.count
+	if n > 0 && n < cb.count {
+		take = n
+	}
+
+	// استخراج آخرین take پیام از بافر دایره‌ای
+	start := (cb.index - take + bufferSize) % bufferSize
+	var lines []string
+	for i := 0; i < take; i++ {
+		msg := cb.data[(start+i)%bufferSize]
+		if msg != "" {
+			lines = append(lines, msg)
 		}
 	}
 
-	if len(messages) <= 1 {
-		return ""
+	if len(lines) == 0 {
+		return "", 0
 	}
-	return strings.Join(messages, "\n")
+
+	prompt := "این یک مکالمه در یک گروه تلگرامی است. لطفاً دو بخش جداگانه به فارسی بنویس:\n\n" +
+		"📌 خلاصه کلی (حداکثر ۳ خط): مهم‌ترین موضوعاتی که در گروه مطرح شده را بنویس.\n\n" +
+		"👤 خلاصه هر عضو: برای هر کاربری که در مکالمه شرکت داشته، یک خط کوتاه بنویس که مهم‌ترین چیزی که گفته را توضیح دهد. فرمت دقیق: «نام: خلاصه»\n\n" +
+		"مکالمه:\n" + strings.Join(lines, "\n")
+
+	return prompt, len(lines)
 }
 
 func (cb *CircularBuffer) Empty() {
@@ -147,6 +201,7 @@ func (cb *CircularBuffer) Empty() {
 		cb.data[i] = ""
 	}
 	cb.index = 0
+	cb.count = 0
 }
 
 func TrimToMax(s string, maxLen int) string {
@@ -173,7 +228,7 @@ func GroqRequest(token string, text string) string {
 					Content: text,
 				},
 			},
-			MaxTokens: 600,
+			MaxTokens: 1200,
 		},
 	)
 	if err != nil {
