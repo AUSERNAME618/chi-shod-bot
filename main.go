@@ -14,12 +14,12 @@ import (
 	"github.com/sashabaranov/go-openai"
 )
 
-const bufferSize = 1000
+const bufferSize = 5000
 
 type CircularBuffer struct {
 	data  [bufferSize]string
 	index int
-	count int // تعداد واقعی پیام‌های ذخیره‌شده
+	count int
 }
 
 func main() {
@@ -46,7 +46,6 @@ func main() {
 	botAPI.Debug = false
 	log.Printf("✅ Bot running as @%s", botAPI.Self.UserName)
 
-	// Health endpoint — keeps Render alive when pinged by UptimeRobot
 	go func() {
 		port := os.Getenv("PORT")
 		if port == "" {
@@ -60,9 +59,9 @@ func main() {
 		http.ListenAndServe(":"+port, nil)
 	}()
 
-	// Polling mode
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
+
 	updates, err := botAPI.GetUpdatesChan(u)
 	if err != nil {
 		log.Panic(err)
@@ -86,44 +85,40 @@ func main() {
 		case text == "/start" || text == "/start@"+botUsername:
 			msg := tgbotapi.NewMessage(chatID,
 				"سلام! 👋\n\n"+
-					"دستورات:\n"+
-					"/chishod — خلاصه همه پیام‌های بافر (تا ۱۰۰۰)\n"+
-					"/chishod 200 — خلاصه ۲۰۰ پیام آخر\n"+
-					"/chishod 500 — خلاصه ۵۰۰ پیام آخر")
+					"برای خلاصه گرفتن:\n"+
+					"/chishod 100 — خلاصه ۱۰۰ پیام آخر\n"+
+					"/chishod 500 — خلاصه ۵۰۰ پیام آخر\n\n"+
+					fmt.Sprintf("📦 ظرفیت حافظه: %d پیام", bufferSize))
 			botAPI.Send(msg)
 
 		case strings.HasPrefix(text, "/chishod"):
-			// استخراج عدد از دستور (مثلاً /chishod 500 یا /chishod500)
 			arg := text
 			arg = strings.TrimPrefix(arg, "/chishod@"+botUsername)
 			arg = strings.TrimPrefix(arg, "/chishod")
 			arg = strings.TrimSpace(arg)
 
-			requestedCount := 0 // 0 = همه پیام‌ها
-
-			if arg != "" {
-				n, parseErr := strconv.Atoi(arg)
-				if parseErr != nil {
-					msg := tgbotapi.NewMessage(chatID,
-						"❌ فرمت اشتباه!\nمثال: /chishod یا /chishod 500")
-					botAPI.Send(msg)
-					continue
-				}
-				if n <= 0 {
-					msg := tgbotapi.NewMessage(chatID, "❌ عدد باید بیشتر از ۰ باشه!")
-					botAPI.Send(msg)
-					continue
-				}
-				// سقف ۱۰۰۰ پیام
-				if n > bufferSize {
-					n = bufferSize
-				}
-				requestedCount = n
+			if arg == "" {
+				msg := tgbotapi.NewMessage(chatID,
+					"لطفاً تعداد پیام رو مشخص کن.\nمثال: /chishod 200")
+				botAPI.Send(msg)
+				continue
 			}
 
-			prompt, actualCount := cb.BuildPrompt(requestedCount)
+			n, parseErr := strconv.Atoi(arg)
+			if parseErr != nil || n <= 0 {
+				msg := tgbotapi.NewMessage(chatID,
+					"عدد معتبر نیست.\nمثال: /chishod 200")
+				botAPI.Send(msg)
+				continue
+			}
+
+			if n > bufferSize {
+				n = bufferSize
+			}
+
+			prompt, actualCount := cb.BuildPrompt(n)
 			if prompt == "" {
-				msg := tgbotapi.NewMessage(chatID, "❌ هنوز پیامی در بافر ثبت نشده!")
+				msg := tgbotapi.NewMessage(chatID, "هنوز پیامی در حافظه ثبت نشده.")
 				botAPI.Send(msg)
 				continue
 			}
@@ -136,7 +131,8 @@ func main() {
 			msg := tgbotapi.NewMessage(chatID, header+summary)
 			msg.ParseMode = "Markdown"
 			botAPI.Send(msg)
-			cb.Empty()
+
+			// ❌ بافر پاک نمی‌شه — حافظه حفظ میشه
 
 		default:
 			cb.AddMessage(update.Message)
@@ -148,6 +144,7 @@ func (cb *CircularBuffer) AddMessage(message *tgbotapi.Message) {
 	if len(strings.TrimSpace(message.Text)) <= 1 {
 		return
 	}
+
 	text := message.From.FirstName
 	if message.ReplyToMessage != nil {
 		text += " (در پاسخ به " + message.ReplyToMessage.From.FirstName + ")"
@@ -161,20 +158,16 @@ func (cb *CircularBuffer) AddMessage(message *tgbotapi.Message) {
 	}
 }
 
-// BuildPrompt آخرین n پیام رو برمیگردونه (n=0 یعنی همه)
-// همچنین تعداد واقعی پیام‌های انتخاب‌شده رو برمیگردونه
 func (cb *CircularBuffer) BuildPrompt(n int) (string, int) {
 	if cb.count == 0 {
 		return "", 0
 	}
 
-	// تعیین تعداد
 	take := cb.count
 	if n > 0 && n < cb.count {
 		take = n
 	}
 
-	// استخراج آخرین take پیام از بافر دایره‌ای
 	start := (cb.index - take + bufferSize) % bufferSize
 	var lines []string
 	for i := 0; i < take; i++ {
@@ -188,35 +181,23 @@ func (cb *CircularBuffer) BuildPrompt(n int) (string, int) {
 		return "", 0
 	}
 
-	prompt := "این یک مکالمه در یک گروه تلگرامی است. لطفاً دو بخش جداگانه به فارسی بنویس:\n\n" +
-		"📌 خلاصه کلی (حداکثر ۳ خط): مهم‌ترین موضوعاتی که در گروه مطرح شده را بنویس.\n\n" +
-		"👤 خلاصه هر عضو: برای هر کاربری که در مکالمه شرکت داشته، یک خط کوتاه بنویس که مهم‌ترین چیزی که گفته را توضیح دهد. فرمت دقیق: «نام: خلاصه»\n\n" +
+	prompt := "این مکالمه از یک گروه تلگرامی فارسی‌زبانه. دو بخش بنویس:\n\n" +
+		"📌 خلاصه کلی:\n" +
+		"همه موضوعاتی که مطرح شده رو پوشش بده — هیچ‌چیزی رو حذف نکن. " +
+		"اگه ۸۰ بحث بود، همه ۸۰ تا رو ذکر کن. طبیعی و روان بنویس، مثل کسی که برای یه دوست تعریف می‌کنه چی شد.\n\n" +
+		"👤 خلاصه هر نفر:\n" +
+		"برای هر کاربری که پیام داده، یه پاراگراف کوتاه اما واقعی بنویس — چه حرفایی زد، " +
+		"چه موضوعاتی مطرح کرد، چه موضعی داشت. فقط چیزی که واقعاً گفته رو بنویس، نه کلیشه. " +
+		"فرمت: «نام: ...\n»\n\n" +
 		"مکالمه:\n" + strings.Join(lines, "\n")
 
 	return prompt, len(lines)
-}
-
-func (cb *CircularBuffer) Empty() {
-	for i := range cb.data {
-		cb.data[i] = ""
-	}
-	cb.index = 0
-	cb.count = 0
-}
-
-func TrimToMax(s string, maxLen int) string {
-	if len(s) > maxLen {
-		return s[:maxLen]
-	}
-	return s
 }
 
 func GroqRequest(token string, text string) string {
 	config := openai.DefaultConfig(token)
 	config.BaseURL = "https://api.groq.com/openai/v1"
 	client := openai.NewClientWithConfig(config)
-
-	text = TrimToMax(text, 14000)
 
 	resp, err := client.CreateChatCompletion(
 		context.Background(),
@@ -228,14 +209,17 @@ func GroqRequest(token string, text string) string {
 					Content: text,
 				},
 			},
-			MaxTokens: 1200,
+			MaxTokens: 4000,
 		},
 	)
+
 	if err != nil {
-		return fmt.Sprintf("❌ خطا در دریافت خلاصه: %v", err)
+		return fmt.Sprintf("❌ خطا: %v", err)
 	}
+
 	if len(resp.Choices) == 0 {
 		return "❌ پاسخی دریافت نشد."
 	}
+
 	return resp.Choices[0].Message.Content
 }
