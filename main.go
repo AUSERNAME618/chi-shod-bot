@@ -41,7 +41,7 @@ func main() {
 
 	groupChatID, err := strconv.ParseInt(groupChatIDStr, 10, 64)
 	if err != nil {
-		log.Fatal("TELEGRAM_GROUP_CHAT_ID must be a valid integer (e.g. -1001234567890)")
+		log.Fatal("TELEGRAM_GROUP_CHAT_ID must be a valid integer")
 	}
 
 	botAPI, err := tgbotapi.NewBotAPI(botToken)
@@ -49,6 +49,9 @@ func main() {
 		log.Panic(err)
 	}
 	botAPI.Debug = false
+
+	// پاک کردن webhook قدیمی تا با polling تداخل نداشته باشه
+	botAPI.RemoveWebhook()
 	log.Printf("✅ Bot running as @%s", botAPI.Self.UserName)
 
 	go func() {
@@ -93,7 +96,7 @@ func main() {
 					"برای خلاصه گرفتن:\n"+
 					"/chishod 100 — خلاصه ۱۰۰ پیام آخر\n"+
 					"/chishod 500 — خلاصه ۵۰۰ پیام آخر\n\n"+
-					fmt.Sprintf("📦 ظرفیت حافظه: %d پیام (وقتی پر بشه، قدیمی‌ها خودکار جای جدیدها رو خالی می‌کنن)", bufferSize))
+					fmt.Sprintf("📦 ظرفیت حافظه: %d پیام", bufferSize))
 			botAPI.Send(msg)
 
 		case strings.HasPrefix(text, "/chishod"):
@@ -119,22 +122,26 @@ func main() {
 				continue
 			}
 
-			botAPI.Send(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping))
+			// در goroutine جدا اجرا میشه تا ربات block نشه
+			go func(chatID int64, lines []string, n, actualCount int) {
+				botAPI.Send(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping))
 
-			summary, err := aiCall(nvidiaToken, buildPrompt(lines))
-			if err != nil {
-				botAPI.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("❌ خطا: %v", err)))
-				continue
-			}
+				var header string
+				if actualCount < n {
+					header = fmt.Sprintf("📋 خلاصه %d پیام موجود (از %d درخواستی):\n\n", actualCount, n)
+				} else {
+					header = fmt.Sprintf("📋 خلاصه %d پیام اخیر:\n\n", actualCount)
+				}
 
-			var header string
-			if actualCount < n {
-				header = fmt.Sprintf("📋 خلاصه %d پیام موجود (کمتر از %d درخواستی، چون هنوز این تعداد جمع نشده):\n\n", actualCount, n)
-			} else {
-				header = fmt.Sprintf("📋 خلاصه %d پیام اخیر:\n\n", actualCount)
-			}
+				summary, err := aiCall(nvidiaToken, buildPrompt(lines))
+				if err != nil {
+					log.Printf("AI error: %v", err)
+					botAPI.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("❌ خطا از سرور هوش مصنوعی:\n%v", err)))
+					return
+				}
 
-			SendLongMessage(botAPI, chatID, header+summary)
+				SendLongMessage(botAPI, chatID, header+summary)
+			}(chatID, lines, n, actualCount)
 
 		default:
 			cb.AddMessage(update.Message)
@@ -160,8 +167,6 @@ func (cb *CircularBuffer) AddMessage(message *tgbotapi.Message) {
 	}
 }
 
-// GetLines دقیقاً n پیامِ آخر رو برمی‌گردونه؛ نه کمتر نه بیشتر
-// (مگر اینکه هنوز اون تعداد پیام در حافظه جمع نشده باشه)
 func (cb *CircularBuffer) GetLines(n int) ([]string, int) {
 	if cb.count == 0 {
 		return nil, 0
@@ -187,15 +192,15 @@ func (cb *CircularBuffer) GetLines(n int) ([]string, int) {
 }
 
 func buildPrompt(lines []string) string {
-	return "این مکالمه از یک گروه تلگرامی فارسی‌زبانه. فقط همین پیام‌هایی که می‌دم رو خلاصه کن، نه کمتر نه بیشتر، و دو بخش جدا بنویس:\n\n" +
+	return "این مکالمه از یک گروه تلگرامی فارسی‌زبانه. فقط همین پیام‌هایی که می‌دم رو خلاصه کن و دو بخش جدا بنویس:\n\n" +
 		"📌 خلاصه کلی:\n" +
-		"همه موضوعات و بحث‌هایی که در همین بازه مطرح شده رو پوشش بده، هیچ‌کدوم رو حذف یا فراموش نکن — حتی اگه ده‌ها موضوع جدا از هم باشن. " +
-		"طوری بنویس که کسی که اصلاً این پیام‌ها رو نخونده، بعد از خوندن خلاصه، دقیقاً بفهمه چه اتفاقی افتاده و چه بحث‌هایی شده، انگار خودش اونجا بوده. " +
+		"همه موضوعات و بحث‌هایی که در همین بازه مطرح شده رو پوشش بده، هیچ‌کدوم رو حذف نکن — حتی اگه ده‌ها موضوع جدا از هم باشن. " +
+		"طوری بنویس که کسی که اصلاً این پیام‌ها رو نخونده، بعد از خوندن خلاصه دقیقاً بفهمه چه اتفاقی افتاده. " +
 		"طبیعی، روان و خودمونی بنویس، نه خشک و رباتیک.\n\n" +
 		"👤 خلاصه هر نفر:\n" +
-		"برای هر کاربری که پیام داده، فقط یک یا دو جمله‌ی کوتاه و مفید بنویس که خلاصه‌ی نقش و حرف‌های اون فرد باشه. " +
-		"از تکرار چیزی که قبلاً توی خلاصه کلی گفتی پرهیز کن، فقط نکته‌ی خاص و متمایز هر نفر رو بگو. شلوغ و پراکنده ننویس.\n\n" +
-		"مکالمه (دقیقاً همین تعداد پیام، نه کمتر نه بیشتر):\n" + strings.Join(lines, "\n")
+		"برای هر کاربری که پیام داده، فقط یک یا دو جمله کوتاه و مفید بنویس که خلاصه نقش و حرف‌های اون فرد باشه. " +
+		"از تکرار چیزهایی که توی خلاصه کلی گفتی پرهیز کن. شلوغ و پراکنده ننویس.\n\n" +
+		"مکالمه:\n" + strings.Join(lines, "\n")
 }
 
 func aiCall(token, prompt string) (string, error) {
@@ -222,7 +227,6 @@ func aiCall(token, prompt string) (string, error) {
 	return resp.Choices[0].Message.Content, nil
 }
 
-// SendLongMessage پیام طولانی رو به چند تکه‌ی زیر ۴۰۹۶ کاراکتر (محدودیت خود تلگرام) تقسیم می‌کنه
 func SendLongMessage(botAPI *tgbotapi.BotAPI, chatID int64, text string) {
 	runes := []rune(text)
 	for len(runes) > 0 {
