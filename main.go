@@ -14,7 +14,12 @@ import (
 	"github.com/sashabaranov/go-openai"
 )
 
-const bufferSize = 5000
+const (
+	bufferSize       = 5000
+	telegramMaxChars = 4000
+	aiModel          = "deepseek-ai/deepseek-v4-pro"
+	aiBaseURL        = "https://integrate.api.nvidia.com/v1"
+)
 
 type CircularBuffer struct {
 	data  [bufferSize]string
@@ -27,11 +32,11 @@ func main() {
 
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	botUsername := os.Getenv("TELEGRAM_BOT_USERNAME")
-	groqToken := os.Getenv("GROQ_API_TOKEN")
+	nvidiaToken := os.Getenv("NVIDIA_API_KEY")
 	groupChatIDStr := os.Getenv("TELEGRAM_GROUP_CHAT_ID")
 
-	if botToken == "" || groqToken == "" || groupChatIDStr == "" {
-		log.Fatal("Missing env vars: TELEGRAM_BOT_TOKEN, GROQ_API_TOKEN, TELEGRAM_GROUP_CHAT_ID")
+	if botToken == "" || nvidiaToken == "" || groupChatIDStr == "" {
+		log.Fatal("Missing env vars: TELEGRAM_BOT_TOKEN, NVIDIA_API_KEY, TELEGRAM_GROUP_CHAT_ID")
 	}
 
 	groupChatID, err := strconv.ParseInt(groupChatIDStr, 10, 64)
@@ -88,7 +93,7 @@ func main() {
 					"برای خلاصه گرفتن:\n"+
 					"/chishod 100 — خلاصه ۱۰۰ پیام آخر\n"+
 					"/chishod 500 — خلاصه ۵۰۰ پیام آخر\n\n"+
-					fmt.Sprintf("📦 ظرفیت حافظه: %d پیام", bufferSize))
+					fmt.Sprintf("📦 ظرفیت حافظه: %d پیام (وقتی پر بشه، قدیمی‌ها خودکار جای جدیدها رو خالی می‌کنن)", bufferSize))
 			botAPI.Send(msg)
 
 		case strings.HasPrefix(text, "/chishod"):
@@ -98,41 +103,38 @@ func main() {
 			arg = strings.TrimSpace(arg)
 
 			if arg == "" {
-				msg := tgbotapi.NewMessage(chatID,
-					"لطفاً تعداد پیام رو مشخص کن.\nمثال: /chishod 200")
-				botAPI.Send(msg)
+				botAPI.Send(tgbotapi.NewMessage(chatID, "لطفاً تعداد پیام رو مشخص کن.\nمثال: /chishod 200"))
 				continue
 			}
 
 			n, parseErr := strconv.Atoi(arg)
 			if parseErr != nil || n <= 0 {
-				msg := tgbotapi.NewMessage(chatID,
-					"عدد معتبر نیست.\nمثال: /chishod 200")
-				botAPI.Send(msg)
+				botAPI.Send(tgbotapi.NewMessage(chatID, "عدد معتبر نیست.\nمثال: /chishod 200"))
 				continue
 			}
 
-			if n > bufferSize {
-				n = bufferSize
-			}
-
-			prompt, actualCount := cb.BuildPrompt(n)
-			if prompt == "" {
-				msg := tgbotapi.NewMessage(chatID, "هنوز پیامی در حافظه ثبت نشده.")
-				botAPI.Send(msg)
+			lines, actualCount := cb.GetLines(n)
+			if len(lines) == 0 {
+				botAPI.Send(tgbotapi.NewMessage(chatID, "هنوز پیامی در حافظه ثبت نشده."))
 				continue
 			}
 
 			botAPI.Send(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping))
 
-			summary := GroqRequest(groqToken, prompt)
+			summary, err := aiCall(nvidiaToken, buildPrompt(lines))
+			if err != nil {
+				botAPI.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("❌ خطا: %v", err)))
+				continue
+			}
 
-			header := fmt.Sprintf("📋 *خلاصه %d پیام اخیر:*\n\n", actualCount)
-			msg := tgbotapi.NewMessage(chatID, header+summary)
-			msg.ParseMode = "Markdown"
-			botAPI.Send(msg)
+			var header string
+			if actualCount < n {
+				header = fmt.Sprintf("📋 خلاصه %d پیام موجود (کمتر از %d درخواستی، چون هنوز این تعداد جمع نشده):\n\n", actualCount, n)
+			} else {
+				header = fmt.Sprintf("📋 خلاصه %d پیام اخیر:\n\n", actualCount)
+			}
 
-			// ❌ بافر پاک نمی‌شه — حافظه حفظ میشه
+			SendLongMessage(botAPI, chatID, header+summary)
 
 		default:
 			cb.AddMessage(update.Message)
@@ -141,12 +143,12 @@ func main() {
 }
 
 func (cb *CircularBuffer) AddMessage(message *tgbotapi.Message) {
-	if len(strings.TrimSpace(message.Text)) <= 1 {
+	if message.From == nil || len(strings.TrimSpace(message.Text)) <= 1 {
 		return
 	}
 
 	text := message.From.FirstName
-	if message.ReplyToMessage != nil {
+	if message.ReplyToMessage != nil && message.ReplyToMessage.From != nil {
 		text += " (در پاسخ به " + message.ReplyToMessage.From.FirstName + ")"
 	}
 	text += ": " + strings.ReplaceAll(message.Text, "\n", " ")
@@ -158,68 +160,87 @@ func (cb *CircularBuffer) AddMessage(message *tgbotapi.Message) {
 	}
 }
 
-func (cb *CircularBuffer) BuildPrompt(n int) (string, int) {
+// GetLines دقیقاً n پیامِ آخر رو برمی‌گردونه؛ نه کمتر نه بیشتر
+// (مگر اینکه هنوز اون تعداد پیام در حافظه جمع نشده باشه)
+func (cb *CircularBuffer) GetLines(n int) ([]string, int) {
 	if cb.count == 0 {
-		return "", 0
+		return nil, 0
 	}
 
-	take := cb.count
-	if n > 0 && n < cb.count {
-		take = n
+	take := n
+	if take > cb.count {
+		take = cb.count
+	}
+	if take > bufferSize {
+		take = bufferSize
 	}
 
 	start := (cb.index - take + bufferSize) % bufferSize
-	var lines []string
+	lines := make([]string, 0, take)
 	for i := 0; i < take; i++ {
 		msg := cb.data[(start+i)%bufferSize]
 		if msg != "" {
 			lines = append(lines, msg)
 		}
 	}
-
-	if len(lines) == 0 {
-		return "", 0
-	}
-
-	prompt := "این مکالمه از یک گروه تلگرامی فارسی‌زبانه. دو بخش بنویس:\n\n" +
-		"📌 خلاصه کلی:\n" +
-		"همه موضوعاتی که مطرح شده رو پوشش بده — هیچ‌چیزی رو حذف نکن. " +
-		"اگه ۸۰ بحث بود، همه ۸۰ تا رو ذکر کن. طبیعی و روان بنویس، مثل کسی که برای یه دوست تعریف می‌کنه چی شد.\n\n" +
-		"👤 خلاصه هر نفر:\n" +
-		"برای هر کاربری که پیام داده، یه پاراگراف کوتاه اما واقعی بنویس — چه حرفایی زد، " +
-		"چه موضوعاتی مطرح کرد، چه موضعی داشت. فقط چیزی که واقعاً گفته رو بنویس، نه کلیشه. " +
-		"فرمت: «نام: ...\n»\n\n" +
-		"مکالمه:\n" + strings.Join(lines, "\n")
-
-	return prompt, len(lines)
+	return lines, len(lines)
 }
 
-func GroqRequest(token string, text string) string {
+func buildPrompt(lines []string) string {
+	return "این مکالمه از یک گروه تلگرامی فارسی‌زبانه. فقط همین پیام‌هایی که می‌دم رو خلاصه کن، نه کمتر نه بیشتر، و دو بخش جدا بنویس:\n\n" +
+		"📌 خلاصه کلی:\n" +
+		"همه موضوعات و بحث‌هایی که در همین بازه مطرح شده رو پوشش بده، هیچ‌کدوم رو حذف یا فراموش نکن — حتی اگه ده‌ها موضوع جدا از هم باشن. " +
+		"طوری بنویس که کسی که اصلاً این پیام‌ها رو نخونده، بعد از خوندن خلاصه، دقیقاً بفهمه چه اتفاقی افتاده و چه بحث‌هایی شده، انگار خودش اونجا بوده. " +
+		"طبیعی، روان و خودمونی بنویس، نه خشک و رباتیک.\n\n" +
+		"👤 خلاصه هر نفر:\n" +
+		"برای هر کاربری که پیام داده، فقط یک یا دو جمله‌ی کوتاه و مفید بنویس که خلاصه‌ی نقش و حرف‌های اون فرد باشه. " +
+		"از تکرار چیزی که قبلاً توی خلاصه کلی گفتی پرهیز کن، فقط نکته‌ی خاص و متمایز هر نفر رو بگو. شلوغ و پراکنده ننویس.\n\n" +
+		"مکالمه (دقیقاً همین تعداد پیام، نه کمتر نه بیشتر):\n" + strings.Join(lines, "\n")
+}
+
+func aiCall(token, prompt string) (string, error) {
 	config := openai.DefaultConfig(token)
-	config.BaseURL = "https://api.groq.com/openai/v1"
+	config.BaseURL = aiBaseURL
 	client := openai.NewClientWithConfig(config)
 
 	resp, err := client.CreateChatCompletion(
 		context.Background(),
 		openai.ChatCompletionRequest{
-			Model: "llama-3.3-70b-versatile",
+			Model: aiModel,
 			Messages: []openai.ChatCompletionMessage{
-				{
-					Role:    openai.ChatMessageRoleUser,
-					Content: text,
-				},
+				{Role: openai.ChatMessageRoleUser, Content: prompt},
 			},
-			MaxTokens: 4000,
+			MaxTokens: 16000,
 		},
 	)
-
 	if err != nil {
-		return fmt.Sprintf("❌ خطا: %v", err)
+		return "", err
 	}
-
 	if len(resp.Choices) == 0 {
-		return "❌ پاسخی دریافت نشد."
+		return "", fmt.Errorf("پاسخی دریافت نشد")
 	}
+	return resp.Choices[0].Message.Content, nil
+}
 
-	return resp.Choices[0].Message.Content
+// SendLongMessage پیام طولانی رو به چند تکه‌ی زیر ۴۰۹۶ کاراکتر (محدودیت خود تلگرام) تقسیم می‌کنه
+func SendLongMessage(botAPI *tgbotapi.BotAPI, chatID int64, text string) {
+	runes := []rune(text)
+	for len(runes) > 0 {
+		cut := telegramMaxChars
+		if len(runes) < cut {
+			cut = len(runes)
+		} else {
+			for i := cut - 1; i > 0; i-- {
+				if runes[i] == '\n' {
+					cut = i
+					break
+				}
+			}
+		}
+		chunk := strings.TrimSpace(string(runes[:cut]))
+		if chunk != "" {
+			botAPI.Send(tgbotapi.NewMessage(chatID, chunk))
+		}
+		runes = runes[cut:]
+	}
 }
